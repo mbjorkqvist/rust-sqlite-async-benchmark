@@ -1,0 +1,21 @@
+[package]
+name = "sqlite-async-benchmark"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark comparing three approaches to SQLite operations in async Rust: direct blocking, spawn_blocking, and tokio-rusqlite"
+authors = ["DFINITY"]
+license = "Apache-2.0"
+
+[dependencies]
+rusqlite = { version = "0.29", features = ["bundled"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rusqlite = "0.4"
+futures = "0.3"
+
+[[bin]]
+name = "benchmark"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+
