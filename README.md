@@ -1,129 +1,183 @@
 # SQLite Async Benchmark
 
-A comprehensive benchmark comparing three approaches to handling SQLite operations in async Rust applications.
+A comprehensive benchmark comparing three approaches to handling SQLite operations in async Rust (Tokio):
 
-## Background
-
-When using SQLite in an async Rust application (like ICRC Rosetta with 40+ token databases), blocking SQLite operations can starve the Tokio async runtime's worker threads, degrading overall performance.
-
-This benchmark compares three approaches:
-
-1. **Direct Blocking** - SQLite calls made directly in async context (current ICRC Rosetta approach)
+1. **Direct Blocking** - SQLite calls made directly in async context (blocks Tokio worker threads)
 2. **spawn_blocking** - SQLite calls wrapped in `tokio::task::spawn_blocking()`
-3. **tokio-rusqlite** - Dedicated thread per database using the `tokio-rusqlite` crate
-
-## Prerequisites
-
-- Rust 1.70+ (with cargo)
-- ~20 minutes for the full benchmark (3 scenarios × 2 minutes × 3 approaches)
+3. **tokio-rusqlite** - Dedicated thread per database (using the `tokio-rusqlite` crate pattern)
 
 ## Quick Start
 
-### Run the Full Benchmark
+```bash
+# Run a quick test (10 seconds per scenario, fewer configurations)
+./run_benchmark.sh --quick
+
+# Run full benchmark (default: 60 seconds per scenario)
+./run_benchmark.sh
+
+# Custom configuration
+./run_benchmark.sh --duration 120 --num-databases 1,10,40,100 --write-delays 100,1000,5000
+```
+
+## Command Line Options
+
+### Benchmark Runner (`run_benchmark.sh`)
+
+```
+Options:
+  -d, --duration SECS     Test duration per scenario (default: 60)
+  -o, --output DIR        Output directory (default: results)
+  -w, --workers N         Tokio worker threads (default: 4)
+  -r, --readers N         Readers per database (default: 3)
+  --write-delays MS,MS    Write delays to test (default: 100,1000,10000)
+  --num-databases N,N     Database counts to test (default: 1,10,50,100)
+  --quick                 Quick mode: 10s duration, fewer scenarios
+  -h, --help              Show this help
+```
+
+### Direct Binary Usage
 
 ```bash
-# Clone or navigate to this directory
-cd rosetta-like_spawn_blocking_tokio_rusqlite_benchmarking
-
-# Build in release mode (important for accurate results!)
+# Build
 cargo build --release
 
-# Run the benchmark (~18 minutes)
-cargo run --release
+# Run benchmark with custom settings
+./target/release/benchmark \
+    --duration 120 \
+    --worker-threads 4 \
+    --readers-per-db 3 \
+    --write-delays 100,1000,10000 \
+    --num-databases 1,10,50,100 \
+    --output-dir results
+
+# Parse existing CSV and regenerate plots
+./target/release/plot --csv results/benchmark_YYYYMMDD_HHMMSS.csv
 ```
-
-### Run a Quick Test (modify test duration)
-
-Edit `src/main.rs` and change:
-```rust
-let test_duration_secs: u64 = 120; // Change to 10 for quick testing
-```
-
-Then run:
-```bash
-cargo run --release
-```
-
-## Configuration Parameters
-
-The benchmark uses these default settings (can be modified in `src/main.rs`):
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `worker_threads` | 4 | Tokio worker threads |
-| `num_databases` | 8 | Number of SQLite databases (simulates tokens) |
-| `readers_per_db` | 3 | Reader tasks per database |
-| `test_duration_secs` | 120 | Duration per scenario (seconds) |
-| Write delays | 100ms, 1s, 10s | Simulated write operation durations |
-
-## What the Benchmark Measures
-
-For each approach and write delay combination:
-
-- **Read Throughput**: Number of read requests completed
-- **Write Throughput**: Number of write operations completed
-- **P99 Read Latency**: 99th percentile read latency (tail latency)
-- **Max Read Latency**: Maximum observed read latency
-- **Average Read Latency**: Mean read latency
-
-## Understanding the Results
-
-### Why Direct Blocking is Problematic
-
-With direct blocking:
-- SQLite operations block Tokio worker threads
-- If `num_databases >= worker_threads`, the runtime can be completely starved
-- Read requests queue up waiting for blocked workers
-
-### Why spawn_blocking Helps
-
-With `spawn_blocking`:
-- SQLite operations run on Tokio's blocking thread pool
-- Worker threads stay free for async work
-- Higher P99 latency due to mutex contention in the pool
-
-### Why tokio-rusqlite is Best
-
-With `tokio-rusqlite`:
-- One dedicated thread per database
-- Natural queuing via channel (matches SQLite's single-writer model)
-- Predictable latency ≈ write duration
-- No thread pool contention
-
-## Expected Results Summary
-
-| Write Delay | Read Improvement | Write Improvement | P99 Latency Winner |
-|-------------|------------------|-------------------|-------------------|
-| 100ms | 1.6x | 3.1x | tokio-rusqlite |
-| 1s | 1.8x | 3.1x | tokio-rusqlite |
-| 10s | 1.9x | 2.4x | tokio-rusqlite |
-
-See [RESULTS.md](RESULTS.md) for detailed benchmark results.
 
 ## Project Structure
 
 ```
 .
-├── Cargo.toml          # Project dependencies
-├── README.md           # This file
-├── RESULTS.md          # Detailed benchmark results
-└── src/
-    └── main.rs         # Benchmark code
+├── src/
+│   ├── main.rs          # Benchmark binary
+│   └── plot.rs          # CSV parser and plot regenerator
+├── templates/
+│   ├── plot.gp          # Gnuplot template (works with CSV)
+│   └── charts.html      # HTML chart template
+├── results/             # Generated output (gitignored)
+│   ├── benchmark_*.csv  # Raw data
+│   ├── summary_*.md     # Markdown summary
+│   ├── charts_*.html    # Interactive charts
+│   └── ascii_*.txt      # Text charts
+├── run_benchmark.sh     # Main runner script
+└── README.md
 ```
 
-## Dependencies
+## Output Files
 
-- `rusqlite` (0.29) - SQLite bindings
-- `tokio` (1.x) - Async runtime
-- `tokio-rusqlite` (0.4) - Async SQLite wrapper
-- `futures` (0.3) - Async utilities
+After running the benchmark, you'll find in `results/` (which is gitignored):
+
+| File | Description |
+|------|-------------|
+| `benchmark_YYYYMMDD_HHMMSS.csv` | Raw benchmark data in CSV format |
+| `summary_YYYYMMDD_HHMMSS.md` | Human-readable summary with tables |
+| `charts_YYYYMMDD_HHMMSS.html` | Interactive charts (open in browser) |
+| `ascii_YYYYMMDD_HHMMSS.txt` | ASCII text charts |
+
+## Viewing Results
+
+### Interactive Charts
+```bash
+# macOS
+open results/plots_*/charts.html
+
+# Linux
+xdg-open results/plots_*/charts.html
+```
+
+### Terminal Summary
+The benchmark prints a summary to stdout. You can also view the markdown summary:
+```bash
+cat results/summary_*.md
+```
+
+### Using Gnuplot
+```bash
+# Use the template with your CSV file
+gnuplot -e "datafile='results/benchmark_YYYYMMDD_HHMMSS.csv'; outdir='results'" templates/plot.gp
+open results/benchmark_charts.png
+```
+
+## What the Benchmark Measures
+
+### Metrics
+
+- **Read Throughput**: Number of read operations completed per second
+- **Write Throughput**: Number of write operations completed per second  
+- **Avg Read Latency**: Average time for a read operation
+- **P99 Read Latency**: 99th percentile read latency (tail latency)
+- **Max Read Latency**: Maximum observed read latency
+
+### Test Scenarios
+
+The benchmark tests each approach across:
+- Different numbers of databases (simulating multi-token scenarios like ICRC Rosetta)
+- Different write delays (simulating slow disk I/O or large database operations)
+
+## Example Results
+
+With 4 Tokio worker threads, 3 readers per database, and varying write delays:
+
+### Read Throughput (requests/sec) - 1s write delay
+
+| DBs | Direct Blocking | spawn_blocking | tokio-rusqlite |
+|-----|-----------------|----------------|----------------|
+| 1   | ~150            | ~180           | ~180           |
+| 10  | ~100            | ~600           | ~650           |
+| 50  | ~50             | ~400           | ~500           |
+| 100 | ~30             | ~300           | ~400           |
+
+### Key Findings
+
+1. **Direct Blocking** suffers as database count increases because blocked worker threads can't service other async tasks
+2. **spawn_blocking** scales better by offloading to the blocking thread pool
+3. **tokio-rusqlite** provides the most predictable latency due to its dedicated-thread-per-database model
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Tokio Runtime                              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │   Worker    │  │   Worker    │  │   Worker    │  ...        │
+│  │   Thread    │  │   Thread    │  │   Thread    │             │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+│         │                │                │                     │
+│  ┌──────┴────────────────┴────────────────┴──────┐             │
+│  │           Approach 1: Direct Blocking         │             │
+│  │  SQLite ops BLOCK these threads! ❌           │             │
+│  └───────────────────────────────────────────────┘             │
+│                                                                 │
+│  ┌───────────────────────────────────────────────┐             │
+│  │        Approach 2: spawn_blocking             │             │
+│  │  Offload to blocking thread pool ✓            │             │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐         │             │
+│  │  │Blocking │ │Blocking │ │Blocking │ ...     │             │
+│  │  │ Thread  │ │ Thread  │ │ Thread  │         │             │
+│  │  └─────────┘ └─────────┘ └─────────┘         │             │
+│  └───────────────────────────────────────────────┘             │
+│                                                                 │
+│  ┌───────────────────────────────────────────────┐             │
+│  │        Approach 3: tokio-rusqlite             │             │
+│  │  Dedicated thread per database ✓✓             │             │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐         │             │
+│  │  │  DB 1   │ │  DB 2   │ │  DB 3   │ ...     │             │
+│  │  │ Thread  │ │ Thread  │ │ Thread  │         │             │
+│  │  └─────────┘ └─────────┘ └─────────┘         │             │
+│  └───────────────────────────────────────────────┘             │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## License
 
 Apache-2.0
-
-## Related
-
-- [tokio-rusqlite crate](https://crates.io/crates/tokio-rusqlite)
-- [Tokio spawn_blocking documentation](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
-

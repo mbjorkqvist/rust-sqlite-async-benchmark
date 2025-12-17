@@ -6,19 +6,82 @@
 //! 2. **spawn_blocking** - SQLite calls wrapped in tokio::task::spawn_blocking()
 //! 3. **tokio-rusqlite** - Dedicated thread per database (like tokio-rusqlite crate)
 //!
-//! Run with: `cargo run --release`
+//! Run with: `cargo run --release -- --help`
 
+use chrono::Local;
+use clap::Parser;
+use csv::Writer;
 use rusqlite::{params, Connection};
+use serde::Serialize;
+use std::fs::File;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_rusqlite::Connection as AsyncConnection;
 
+/// SQLite Async Benchmark - Compare direct blocking, spawn_blocking, and tokio-rusqlite
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Test duration in seconds per scenario
+    #[arg(short = 'd', long, default_value_t = 120)]
+    duration: u64,
+
+    /// Output directory for results (CSV, graph, summary)
+    #[arg(short = 'o', long, default_value = "results")]
+    output_dir: PathBuf,
+
+    /// Number of Tokio worker threads
+    #[arg(short = 'w', long, default_value_t = 4)]
+    worker_threads: usize,
+
+    /// Readers per database
+    #[arg(short = 'r', long, default_value_t = 3)]
+    readers_per_db: usize,
+
+    /// Write delays to test (comma-separated, in ms)
+    #[arg(long, default_value = "100,1000,10000", value_delimiter = ',')]
+    write_delays: Vec<u64>,
+
+    /// Number of databases to test (comma-separated)
+    #[arg(long, default_value = "1,10,50,100", value_delimiter = ',')]
+    num_databases: Vec<usize>,
+}
+
+// ============================================================================
+// CSV Result Structure
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+struct BenchmarkResult {
+    approach: String,
+    num_databases: usize,
+    write_delay_ms: u64,
+    test_duration_secs: u64,
+    worker_threads: usize,
+    readers_per_db: usize,
+    // Read metrics
+    read_requests_completed: u64,
+    read_throughput_per_sec: f64,
+    avg_read_latency_ms: f64,
+    p50_read_latency_ms: f64,
+    p99_read_latency_ms: f64,
+    max_read_latency_ms: f64,
+    // Write metrics
+    write_ops_completed: u64,
+    write_throughput_per_sec: f64,
+    avg_write_latency_ms: f64,
+    p99_write_latency_ms: f64,
+    // Starvation indicator: ratio of expected vs actual throughput
+    write_completion_ratio: f64,
+}
+
 // ============================================================================
 // Database Operations
 // ============================================================================
 
-/// Create test schema and seed data
 fn setup_database(conn: &Connection) {
     conn.execute_batch(
         "
@@ -46,7 +109,6 @@ fn setup_database(conn: &Connection) {
     )
     .expect("Failed to create schema");
 
-    // Seed some initial data
     for i in 0..100 {
         conn.execute(
             "INSERT INTO blocks (hash, parent_hash, timestamp, data) VALUES (?1, ?2, ?3, ?4)",
@@ -74,11 +136,9 @@ fn setup_database(conn: &Connection) {
     }
 }
 
-/// Perform a write operation with configurable delay
 fn do_write_operation_with_delay(conn: &Connection, block_num: u64, delay_ms: u64) {
-    // Simulate additional I/O latency (disk, network, etc.)
     if delay_ms > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        std::thread::sleep(Duration::from_millis(delay_ms));
     }
 
     conn.execute(
@@ -107,7 +167,6 @@ fn do_write_operation_with_delay(conn: &Connection, block_num: u64, delay_ms: u6
     }
 }
 
-/// Perform a read operation (SELECT with JOIN)
 fn do_read_operation(conn: &Connection) -> usize {
     let mut stmt = conn
         .prepare_cached(
@@ -132,31 +191,44 @@ fn do_read_operation(conn: &Connection) -> usize {
 }
 
 // ============================================================================
-// Test Results
+// Internal Result Structure
 // ============================================================================
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct TestResults {
-    mode: String,
     read_requests_completed: u64,
     write_ops_completed: u64,
-    avg_read_latency_ms: f64,
-    max_read_latency_ms: u64,
-    p99_read_latency_ms: u64,
+    read_latencies_us: Vec<u64>,
+    write_latencies_us: Vec<u64>,
 }
 
-#[allow(dead_code)]
 impl TestResults {
-    fn print(&self) {
-        println!("\n  === {} ===", self.mode);
-        println!("  Read requests completed:   {}", self.read_requests_completed);
-        println!("  Write ops completed:       {}", self.write_ops_completed);
-        if self.read_requests_completed > 0 {
-            println!("  Average read latency:      {:.2} ms", self.avg_read_latency_ms);
-            println!("  P99 read latency:          {} ms", self.p99_read_latency_ms);
-            println!("  Max read latency:          {} ms", self.max_read_latency_ms);
+    fn new() -> Self {
+        Self {
+            read_requests_completed: 0,
+            write_ops_completed: 0,
+            read_latencies_us: Vec::new(),
+            write_latencies_us: Vec::new(),
         }
+    }
+
+    fn compute_percentile(latencies: &[u64], percentile: f64) -> f64 {
+        if latencies.is_empty() {
+            return 0.0;
+        }
+        let idx = ((latencies.len() as f64 * percentile / 100.0) as usize).min(latencies.len() - 1);
+        latencies[idx] as f64 / 1000.0 // Convert to ms
+    }
+
+    fn compute_avg(latencies: &[u64]) -> f64 {
+        if latencies.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = latencies.iter().sum();
+        sum as f64 / latencies.len() as f64 / 1000.0 // Convert to ms
+    }
+
+    fn compute_max(latencies: &[u64]) -> f64 {
+        latencies.iter().max().copied().unwrap_or(0) as f64 / 1000.0
     }
 }
 
@@ -179,11 +251,10 @@ fn run_direct_blocking(
         })
         .collect();
 
-    let read_requests_completed = Arc::new(AtomicU64::new(0));
-    let write_ops_completed = Arc::new(AtomicU64::new(0));
-    let total_read_latency_us = Arc::new(AtomicU64::new(0));
-    let max_read_latency_us = Arc::new(AtomicU64::new(0));
-    let latencies = Arc::new(Mutex::new(Vec::new()));
+    let read_latencies = Arc::new(Mutex::new(Vec::new()));
+    let write_latencies = Arc::new(Mutex::new(Vec::new()));
+    let read_count = Arc::new(AtomicU64::new(0));
+    let write_count = Arc::new(AtomicU64::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -195,50 +266,54 @@ fn run_direct_blocking(
     rt.block_on(async {
         let mut handles = Vec::new();
 
-        // One writer per database
+        // Writers - measure from task start (includes queue time via yield)
         for (db_idx, db) in databases.iter().enumerate() {
             let db = db.clone();
             let stop = stop_flag.clone();
-            let ops = write_ops_completed.clone();
+            let count = write_count.clone();
+            let latencies = write_latencies.clone();
             let delay = write_delay_ms;
 
             handles.push(tokio::spawn(async move {
                 let mut block_num = db_idx as u64 * 10000;
                 while !stop.load(Ordering::Relaxed) {
+                    let start = Instant::now();
+                    // This blocks the Tokio worker thread!
                     {
                         let c = db.lock().unwrap();
                         do_write_operation_with_delay(&c, block_num, delay);
                     }
-                    ops.fetch_add(1, Ordering::Relaxed);
+                    let elapsed_us = start.elapsed().as_micros() as u64;
+                    latencies.lock().unwrap().push(elapsed_us);
+                    count.fetch_add(1, Ordering::Relaxed);
                     block_num += 1;
+                    // Yield to allow other tasks to run
                     tokio::task::yield_now().await;
                 }
             }));
         }
 
-        // Multiple readers per database
+        // Readers - measure from task start
         for db in databases.iter() {
             for _ in 0..readers_per_db {
                 let db = db.clone();
                 let stop = stop_flag.clone();
-                let reqs = read_requests_completed.clone();
-                let latency = total_read_latency_us.clone();
-                let max_lat = max_read_latency_us.clone();
-                let lats = latencies.clone();
+                let count = read_count.clone();
+                let latencies = read_latencies.clone();
 
                 handles.push(tokio::spawn(async move {
                     while !stop.load(Ordering::Relaxed) {
                         let start = Instant::now();
+                        // This blocks the Tokio worker thread!
                         {
                             let c = db.lock().unwrap();
                             do_read_operation(&c);
                         }
                         let elapsed_us = start.elapsed().as_micros() as u64;
-                        latency.fetch_add(elapsed_us, Ordering::Relaxed);
-                        max_lat.fetch_max(elapsed_us, Ordering::Relaxed);
-                        lats.lock().unwrap().push(elapsed_us);
-                        reqs.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        latencies.lock().unwrap().push(elapsed_us);
+                        count.fetch_add(1, Ordering::Relaxed);
+                        // Small delay between reads
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }));
             }
@@ -247,26 +322,23 @@ fn run_direct_blocking(
         tokio::time::sleep(Duration::from_secs(test_duration_secs)).await;
         stop_flag.store(true, Ordering::Relaxed);
 
+        // Give tasks time to finish their current operation
+        let timeout = Duration::from_millis(write_delay_ms + 1000);
         for handle in handles {
-            let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
+            let _ = tokio::time::timeout(timeout, handle).await;
         }
     });
 
-    let reqs_count = read_requests_completed.load(Ordering::Relaxed);
-    let latency_us = total_read_latency_us.load(Ordering::Relaxed);
-
-    let mut lats = latencies.lock().unwrap();
-    lats.sort();
-    let p99_idx = (lats.len() as f64 * 0.99) as usize;
-    let p99 = lats.get(p99_idx).copied().unwrap_or(0);
+    let mut read_lats = read_latencies.lock().unwrap().clone();
+    let mut write_lats = write_latencies.lock().unwrap().clone();
+    read_lats.sort_unstable();
+    write_lats.sort_unstable();
 
     TestResults {
-        mode: "1. DIRECT BLOCKING".to_string(),
-        read_requests_completed: reqs_count,
-        write_ops_completed: write_ops_completed.load(Ordering::Relaxed),
-        avg_read_latency_ms: if reqs_count > 0 { latency_us as f64 / reqs_count as f64 / 1000.0 } else { 0.0 },
-        max_read_latency_ms: max_read_latency_us.load(Ordering::Relaxed) / 1000,
-        p99_read_latency_ms: p99 / 1000,
+        read_requests_completed: read_count.load(Ordering::Relaxed),
+        write_ops_completed: write_count.load(Ordering::Relaxed),
+        read_latencies_us: read_lats,
+        write_latencies_us: write_lats,
     }
 }
 
@@ -289,11 +361,10 @@ fn run_spawn_blocking(
         })
         .collect();
 
-    let read_requests_completed = Arc::new(AtomicU64::new(0));
-    let write_ops_completed = Arc::new(AtomicU64::new(0));
-    let total_read_latency_us = Arc::new(AtomicU64::new(0));
-    let max_read_latency_us = Arc::new(AtomicU64::new(0));
-    let latencies = Arc::new(Mutex::new(Vec::new()));
+    let read_latencies = Arc::new(Mutex::new(Vec::new()));
+    let write_latencies = Arc::new(Mutex::new(Vec::new()));
+    let read_count = Arc::new(AtomicU64::new(0));
+    let write_count = Arc::new(AtomicU64::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -305,19 +376,22 @@ fn run_spawn_blocking(
     rt.block_on(async {
         let mut handles = Vec::new();
 
-        // One writer per database with spawn_blocking
+        // Writers with spawn_blocking
         for (db_idx, db) in databases.iter().enumerate() {
             let db = db.clone();
             let stop = stop_flag.clone();
-            let ops = write_ops_completed.clone();
+            let count = write_count.clone();
+            let latencies = write_latencies.clone();
             let delay = write_delay_ms;
 
             handles.push(tokio::spawn(async move {
                 let mut block_num = db_idx as u64 * 10000;
                 while !stop.load(Ordering::Relaxed) {
+                    let start = Instant::now();
                     let db = db.clone();
                     let bn = block_num;
 
+                    // Offload to blocking thread pool
                     tokio::task::spawn_blocking(move || {
                         let c = db.lock().unwrap();
                         do_write_operation_with_delay(&c, bn, delay);
@@ -325,27 +399,28 @@ fn run_spawn_blocking(
                     .await
                     .ok();
 
-                    ops.fetch_add(1, Ordering::Relaxed);
+                    let elapsed_us = start.elapsed().as_micros() as u64;
+                    latencies.lock().unwrap().push(elapsed_us);
+                    count.fetch_add(1, Ordering::Relaxed);
                     block_num += 1;
                 }
             }));
         }
 
-        // Multiple readers per database with spawn_blocking
+        // Readers with spawn_blocking
         for db in databases.iter() {
             for _ in 0..readers_per_db {
                 let db = db.clone();
                 let stop = stop_flag.clone();
-                let reqs = read_requests_completed.clone();
-                let latency = total_read_latency_us.clone();
-                let max_lat = max_read_latency_us.clone();
-                let lats = latencies.clone();
+                let count = read_count.clone();
+                let latencies = read_latencies.clone();
 
                 handles.push(tokio::spawn(async move {
                     while !stop.load(Ordering::Relaxed) {
                         let start = Instant::now();
-
                         let db = db.clone();
+
+                        // Offload to blocking thread pool
                         tokio::task::spawn_blocking(move || {
                             let c = db.lock().unwrap();
                             do_read_operation(&c);
@@ -354,11 +429,9 @@ fn run_spawn_blocking(
                         .ok();
 
                         let elapsed_us = start.elapsed().as_micros() as u64;
-                        latency.fetch_add(elapsed_us, Ordering::Relaxed);
-                        max_lat.fetch_max(elapsed_us, Ordering::Relaxed);
-                        lats.lock().unwrap().push(elapsed_us);
-                        reqs.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        latencies.lock().unwrap().push(elapsed_us);
+                        count.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }));
             }
@@ -372,21 +445,16 @@ fn run_spawn_blocking(
         }
     });
 
-    let reqs_count = read_requests_completed.load(Ordering::Relaxed);
-    let latency_us = total_read_latency_us.load(Ordering::Relaxed);
-
-    let mut lats = latencies.lock().unwrap();
-    lats.sort();
-    let p99_idx = (lats.len() as f64 * 0.99) as usize;
-    let p99 = lats.get(p99_idx).copied().unwrap_or(0);
+    let mut read_lats = read_latencies.lock().unwrap().clone();
+    let mut write_lats = write_latencies.lock().unwrap().clone();
+    read_lats.sort_unstable();
+    write_lats.sort_unstable();
 
     TestResults {
-        mode: "2. SPAWN_BLOCKING".to_string(),
-        read_requests_completed: reqs_count,
-        write_ops_completed: write_ops_completed.load(Ordering::Relaxed),
-        avg_read_latency_ms: if reqs_count > 0 { latency_us as f64 / reqs_count as f64 / 1000.0 } else { 0.0 },
-        max_read_latency_ms: max_read_latency_us.load(Ordering::Relaxed) / 1000,
-        p99_read_latency_ms: p99 / 1000,
+        read_requests_completed: read_count.load(Ordering::Relaxed),
+        write_ops_completed: write_count.load(Ordering::Relaxed),
+        read_latencies_us: read_lats,
+        write_latencies_us: write_lats,
     }
 }
 
@@ -401,11 +469,10 @@ fn run_tokio_rusqlite(
     test_duration_secs: u64,
     write_delay_ms: u64,
 ) -> TestResults {
-    let read_requests_completed = Arc::new(AtomicU64::new(0));
-    let write_ops_completed = Arc::new(AtomicU64::new(0));
-    let total_read_latency_us = Arc::new(AtomicU64::new(0));
-    let max_read_latency_us = Arc::new(AtomicU64::new(0));
-    let latencies = Arc::new(Mutex::new(Vec::new()));
+    let read_latencies = Arc::new(Mutex::new(Vec::new()));
+    let write_latencies = Arc::new(Mutex::new(Vec::new()));
+    let read_count = Arc::new(AtomicU64::new(0));
+    let write_count = Arc::new(AtomicU64::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -436,18 +503,21 @@ fn run_tokio_rusqlite(
 
         let mut handles = Vec::new();
 
-        // One writer per database using tokio-rusqlite
+        // Writers using tokio-rusqlite
         for (db_idx, db) in databases.iter().enumerate() {
             let db = db.clone();
             let stop = stop_flag.clone();
-            let ops = write_ops_completed.clone();
+            let count = write_count.clone();
+            let latencies = write_latencies.clone();
             let delay = write_delay_ms;
 
             handles.push(tokio::spawn(async move {
                 let mut block_num = db_idx as u64 * 10000;
                 while !stop.load(Ordering::Relaxed) {
+                    let start = Instant::now();
                     let bn = block_num;
 
+                    // tokio-rusqlite handles the threading
                     db.call(move |conn| {
                         do_write_operation_with_delay(conn, bn, delay);
                         Ok(())
@@ -455,34 +525,32 @@ fn run_tokio_rusqlite(
                     .await
                     .ok();
 
-                    ops.fetch_add(1, Ordering::Relaxed);
+                    let elapsed_us = start.elapsed().as_micros() as u64;
+                    latencies.lock().unwrap().push(elapsed_us);
+                    count.fetch_add(1, Ordering::Relaxed);
                     block_num += 1;
                 }
             }));
         }
 
-        // Multiple readers per database using tokio-rusqlite
+        // Readers using tokio-rusqlite
         for db in databases.iter() {
             for _ in 0..readers_per_db {
                 let db = db.clone();
                 let stop = stop_flag.clone();
-                let reqs = read_requests_completed.clone();
-                let latency = total_read_latency_us.clone();
-                let max_lat = max_read_latency_us.clone();
-                let lats = latencies.clone();
+                let count = read_count.clone();
+                let latencies = read_latencies.clone();
 
                 handles.push(tokio::spawn(async move {
                     while !stop.load(Ordering::Relaxed) {
                         let start = Instant::now();
 
-                        let _ = db.call(|conn| Ok(do_read_operation(conn))).await;
+                        db.call(|conn| Ok(do_read_operation(conn))).await.ok();
 
                         let elapsed_us = start.elapsed().as_micros() as u64;
-                        latency.fetch_add(elapsed_us, Ordering::Relaxed);
-                        max_lat.fetch_max(elapsed_us, Ordering::Relaxed);
-                        lats.lock().unwrap().push(elapsed_us);
-                        reqs.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        latencies.lock().unwrap().push(elapsed_us);
+                        count.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }));
             }
@@ -498,252 +566,917 @@ fn run_tokio_rusqlite(
         drop(databases);
     });
 
-    let reqs_count = read_requests_completed.load(Ordering::Relaxed);
-    let latency_us = total_read_latency_us.load(Ordering::Relaxed);
-
-    let mut lats = latencies.lock().unwrap();
-    lats.sort();
-    let p99_idx = (lats.len() as f64 * 0.99) as usize;
-    let p99 = lats.get(p99_idx).copied().unwrap_or(0);
+    let mut read_lats = read_latencies.lock().unwrap().clone();
+    let mut write_lats = write_latencies.lock().unwrap().clone();
+    read_lats.sort_unstable();
+    write_lats.sort_unstable();
 
     TestResults {
-        mode: "3. TOKIO-RUSQLITE".to_string(),
-        read_requests_completed: reqs_count,
-        write_ops_completed: write_ops_completed.load(Ordering::Relaxed),
-        avg_read_latency_ms: if reqs_count > 0 { latency_us as f64 / reqs_count as f64 / 1000.0 } else { 0.0 },
-        max_read_latency_ms: max_read_latency_us.load(Ordering::Relaxed) / 1000,
-        p99_read_latency_ms: p99 / 1000,
+        read_requests_completed: read_count.load(Ordering::Relaxed),
+        write_ops_completed: write_count.load(Ordering::Relaxed),
+        read_latencies_us: read_lats,
+        write_latencies_us: write_lats,
     }
 }
 
 // ============================================================================
-// Main Benchmark
+// Main
 // ============================================================================
 
 fn main() {
+    let args = Args::parse();
+
+    // Create output directory
+    std::fs::create_dir_all(&args.output_dir).expect("Failed to create output directory");
+
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let csv_path = args.output_dir.join(format!("benchmark_{}.csv", timestamp));
+    let summary_path = args.output_dir.join(format!("summary_{}.md", timestamp));
+
     println!("\n");
     println!("╔══════════════════════════════════════════════════════════════════════════════╗");
-    println!("║     COMPREHENSIVE BENCHMARK: Three Approaches × Three Write Durations        ║");
-    println!("╠══════════════════════════════════════════════════════════════════════════════╣");
-    println!("║ Write Durations: 100ms, 1s, 10s                                              ║");
-    println!("║ Test Duration: 2 minutes per scenario                                        ║");
-    println!("║ Total Runtime: ~18+ minutes                                                  ║");
+    println!("║              SQLite Async Benchmark - Comprehensive Test                     ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════╝");
-
-    let worker_threads: usize = 4;
-    let num_databases: usize = 8;
-    let readers_per_db: usize = 3;
-    let test_duration_secs: u64 = 120; // 2 minutes per test
-
-    let write_delays = vec![(100, "100ms"), (1_000, "1s"), (10_000, "10s")];
 
     println!();
     println!("Configuration:");
-    println!("  Tokio worker threads: {}", worker_threads);
-    println!("  Token databases:      {}", num_databases);
-    println!("  Writers per DB:       1");
-    println!("  Readers per DB:       {}", readers_per_db);
-    println!("  Test duration:        {} seconds (2 minutes)", test_duration_secs);
+    println!("  Tokio worker threads: {}", args.worker_threads);
+    println!("  Readers per DB:       {}", args.readers_per_db);
+    println!("  Test duration:        {} seconds", args.duration);
+    println!("  Database counts:      {:?}", args.num_databases);
+    println!("  Write delays (ms):    {:?}", args.write_delays);
+    println!("  Output directory:     {}", args.output_dir.display());
     println!();
 
-    // Store all results
-    let mut all_results: Vec<(String, TestResults, TestResults, TestResults)> = Vec::new();
-
-    for (delay_ms, delay_name) in &write_delays {
-        println!("\n");
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("  SCENARIO: {} write delay", delay_name);
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-        println!("\n  Running DIRECT BLOCKING ({})...", delay_name);
-        let start = std::time::Instant::now();
-        let results_direct = run_direct_blocking(
-            worker_threads,
-            num_databases,
-            readers_per_db,
-            test_duration_secs,
-            *delay_ms,
-        );
-        println!("  ✓ Completed in {:.1}s", start.elapsed().as_secs_f64());
-
-        println!("\n  Running SPAWN_BLOCKING ({})...", delay_name);
-        let start = std::time::Instant::now();
-        let results_spawn = run_spawn_blocking(
-            worker_threads,
-            num_databases,
-            readers_per_db,
-            test_duration_secs,
-            *delay_ms,
-        );
-        println!("  ✓ Completed in {:.1}s", start.elapsed().as_secs_f64());
-
-        println!("\n  Running TOKIO-RUSQLITE ({})...", delay_name);
-        let start = std::time::Instant::now();
-        let results_tokio = run_tokio_rusqlite(
-            worker_threads,
-            num_databases,
-            readers_per_db,
-            test_duration_secs,
-            *delay_ms,
-        );
-        println!("  ✓ Completed in {:.1}s", start.elapsed().as_secs_f64());
-
-        all_results.push((delay_name.to_string(), results_direct, results_spawn, results_tokio));
-    }
-
-    // Print comprehensive results
-    print_results(&all_results, worker_threads, num_databases, readers_per_db, test_duration_secs);
-}
-
-fn print_results(
-    all_results: &[(String, TestResults, TestResults, TestResults)],
-    worker_threads: usize,
-    num_databases: usize,
-    readers_per_db: usize,
-    test_duration_secs: u64,
-) {
-    println!("\n\n");
-    println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                              COMPREHENSIVE BENCHMARK RESULTS                                         ║");
-    println!("╠══════════════════════════════════════════════════════════════════════════════════════════════════════╣");
+    let total_tests = args.num_databases.len() * args.write_delays.len() * 3;
+    let estimated_time = total_tests as u64 * args.duration;
     println!(
-        "║ Configuration: {} worker threads, {} databases, {} readers/db, {}s test duration               ║",
-        worker_threads, num_databases, readers_per_db, test_duration_secs
+        "  Total tests: {} (estimated time: {} minutes)",
+        total_tests,
+        estimated_time / 60
     );
-    println!("╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝");
+    println!();
 
-    // Read throughput table
-    println!("\n");
-    println!("┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐");
-    println!("│                                    READ THROUGHPUT (requests)                                       │");
-    println!("├───────────────┬───────────────────┬───────────────────┬───────────────────┬────────────────────────┤");
-    println!("│ Write Delay   │ Direct Blocking   │ spawn_blocking    │ tokio-rusqlite    │ Best Improvement       │");
-    println!("├───────────────┼───────────────────┼───────────────────┼───────────────────┼────────────────────────┤");
+    // Collect all results
+    let mut all_results: Vec<BenchmarkResult> = Vec::new();
 
-    for (delay_name, direct, spawn, tokio) in all_results {
-        let best = spawn.read_requests_completed.max(tokio.read_requests_completed);
-        let improvement = if direct.read_requests_completed > 0 {
-            format!("{:.1}x", best as f64 / direct.read_requests_completed as f64)
-        } else {
-            "∞".to_string()
-        };
-        println!(
-            "│ {:13} │ {:17} │ {:17} │ {:17} │ {:22} │",
-            delay_name,
-            direct.read_requests_completed,
-            spawn.read_requests_completed,
-            tokio.read_requests_completed,
-            improvement
-        );
+    let mut test_num = 0;
+    for &num_dbs in &args.num_databases {
+        for &write_delay in &args.write_delays {
+            let delay_name = format_delay(write_delay);
+
+            // Calculate expected writes (1 writer per DB, each write takes write_delay ms)
+            let expected_writes_per_db = (args.duration * 1000) / write_delay.max(1);
+            let expected_total_writes = expected_writes_per_db * num_dbs as u64;
+
+            println!(
+                "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            );
+            println!(
+                "  SCENARIO: {} databases, {} write delay (expected ~{} writes)",
+                num_dbs, delay_name, expected_total_writes
+            );
+            println!(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            );
+
+            // Direct Blocking
+            test_num += 1;
+            println!(
+                "\n  [{}/{}] Running DIRECT BLOCKING...",
+                test_num, total_tests
+            );
+            let start = Instant::now();
+            let results = run_direct_blocking(
+                args.worker_threads,
+                num_dbs,
+                args.readers_per_db,
+                args.duration,
+                write_delay,
+            );
+            println!("  ✓ Completed in {:.1}s", start.elapsed().as_secs_f64());
+            println!(
+                "    Reads: {}, Writes: {} ({:.1}% of expected)",
+                results.read_requests_completed,
+                results.write_ops_completed,
+                results.write_ops_completed as f64 / expected_total_writes as f64 * 100.0
+            );
+            all_results.push(to_benchmark_result(
+                "direct_blocking",
+                num_dbs,
+                write_delay,
+                expected_total_writes,
+                &args,
+                &results,
+            ));
+
+            // spawn_blocking
+            test_num += 1;
+            println!(
+                "\n  [{}/{}] Running SPAWN_BLOCKING...",
+                test_num, total_tests
+            );
+            let start = Instant::now();
+            let results = run_spawn_blocking(
+                args.worker_threads,
+                num_dbs,
+                args.readers_per_db,
+                args.duration,
+                write_delay,
+            );
+            println!("  ✓ Completed in {:.1}s", start.elapsed().as_secs_f64());
+            println!(
+                "    Reads: {}, Writes: {} ({:.1}% of expected)",
+                results.read_requests_completed,
+                results.write_ops_completed,
+                results.write_ops_completed as f64 / expected_total_writes as f64 * 100.0
+            );
+            all_results.push(to_benchmark_result(
+                "spawn_blocking",
+                num_dbs,
+                write_delay,
+                expected_total_writes,
+                &args,
+                &results,
+            ));
+
+            // tokio-rusqlite
+            test_num += 1;
+            println!(
+                "\n  [{}/{}] Running TOKIO-RUSQLITE...",
+                test_num, total_tests
+            );
+            let start = Instant::now();
+            let results = run_tokio_rusqlite(
+                args.worker_threads,
+                num_dbs,
+                args.readers_per_db,
+                args.duration,
+                write_delay,
+            );
+            println!("  ✓ Completed in {:.1}s", start.elapsed().as_secs_f64());
+            println!(
+                "    Reads: {}, Writes: {} ({:.1}% of expected)",
+                results.read_requests_completed,
+                results.write_ops_completed,
+                results.write_ops_completed as f64 / expected_total_writes as f64 * 100.0
+            );
+            all_results.push(to_benchmark_result(
+                "tokio_rusqlite",
+                num_dbs,
+                write_delay,
+                expected_total_writes,
+                &args,
+                &results,
+            ));
+        }
     }
-    println!("└───────────────┴───────────────────┴───────────────────┴───────────────────┴────────────────────────┘");
 
-    // Write throughput table
+    // Write CSV
+    println!("\n\n  Writing results to CSV: {}", csv_path.display());
+    write_csv(&csv_path, &all_results).expect("Failed to write CSV");
+
+    // Write summary
+    println!("  Writing summary to: {}", summary_path.display());
+    write_summary(&summary_path, &args, &all_results).expect("Failed to write summary");
+
+    // Generate plot
+    println!("  Generating plots...");
+    generate_plots(&args.output_dir, &all_results, &timestamp.to_string());
+
     println!("\n");
-    println!("┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐");
-    println!("│                                    WRITE THROUGHPUT (operations)                                    │");
-    println!("├───────────────┬───────────────────┬───────────────────┬───────────────────┬────────────────────────┤");
-    println!("│ Write Delay   │ Direct Blocking   │ spawn_blocking    │ tokio-rusqlite    │ Best Improvement       │");
-    println!("├───────────────┼───────────────────┼───────────────────┼───────────────────┼────────────────────────┤");
-
-    for (delay_name, direct, spawn, tokio) in all_results {
-        let best = spawn.write_ops_completed.max(tokio.write_ops_completed);
-        let improvement = if direct.write_ops_completed > 0 {
-            format!("{:.1}x", best as f64 / direct.write_ops_completed as f64)
-        } else {
-            "∞".to_string()
-        };
-        println!(
-            "│ {:13} │ {:17} │ {:17} │ {:17} │ {:22} │",
-            delay_name,
-            direct.write_ops_completed,
-            spawn.write_ops_completed,
-            tokio.write_ops_completed,
-            improvement
-        );
-    }
-    println!("└───────────────┴───────────────────┴───────────────────┴───────────────────┴────────────────────────┘");
-
-    // P99 latency table
-    println!("\n");
-    println!("┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐");
-    println!("│                                    P99 READ LATENCY (ms)                                            │");
-    println!("├───────────────┬───────────────────┬───────────────────┬───────────────────┬────────────────────────┤");
-    println!("│ Write Delay   │ Direct Blocking   │ spawn_blocking    │ tokio-rusqlite    │ Best (lowest)          │");
-    println!("├───────────────┼───────────────────┼───────────────────┼───────────────────┼────────────────────────┤");
-
-    for (delay_name, direct, spawn, tokio) in all_results {
-        let best = if spawn.p99_read_latency_ms < tokio.p99_read_latency_ms {
-            "spawn_blocking"
-        } else {
-            "tokio-rusqlite"
-        };
-        let best_val = spawn.p99_read_latency_ms.min(tokio.p99_read_latency_ms);
-        println!(
-            "│ {:13} │ {:17} │ {:17} │ {:17} │ {} ({} ms)    │",
-            delay_name,
-            direct.p99_read_latency_ms,
-            spawn.p99_read_latency_ms,
-            tokio.p99_read_latency_ms,
-            best,
-            best_val
-        );
-    }
-    println!("└───────────────┴───────────────────┴───────────────────┴───────────────────┴────────────────────────┘");
-
-    // Max latency table
-    println!("\n");
-    println!("┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐");
-    println!("│                                    MAX READ LATENCY (ms)                                            │");
-    println!("├───────────────┬───────────────────┬───────────────────┬───────────────────┬────────────────────────┤");
-    println!("│ Write Delay   │ Direct Blocking   │ spawn_blocking    │ tokio-rusqlite    │ Best (lowest)          │");
-    println!("├───────────────┼───────────────────┼───────────────────┼───────────────────┼────────────────────────┤");
-
-    for (delay_name, direct, spawn, tokio) in all_results {
-        let best = if spawn.max_read_latency_ms < tokio.max_read_latency_ms {
-            "spawn_blocking"
-        } else {
-            "tokio-rusqlite"
-        };
-        let best_val = spawn.max_read_latency_ms.min(tokio.max_read_latency_ms);
-        println!(
-            "│ {:13} │ {:17} │ {:17} │ {:17} │ {} ({} ms)    │",
-            delay_name,
-            direct.max_read_latency_ms,
-            spawn.max_read_latency_ms,
-            tokio.max_read_latency_ms,
-            best,
-            best_val
-        );
-    }
-    println!("└───────────────┴───────────────────┴───────────────────┴───────────────────┴────────────────────────┘");
-
-    // Summary
-    println!("\n");
-    println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                                         SUMMARY                                                      ║");
-    println!("╠══════════════════════════════════════════════════════════════════════════════════════════════════════╣");
-    println!("║                                                                                                      ║");
-    println!("║  📊 READ THROUGHPUT:                                                                                 ║");
-    println!("║     - spawn_blocking and tokio-rusqlite consistently outperform direct blocking                      ║");
-    println!("║     - Improvement increases with write duration (longer blocking = worse direct performance)         ║");
-    println!("║                                                                                                      ║");
-    println!("║  📊 WRITE THROUGHPUT:                                                                                ║");
-    println!("║     - spawn_blocking and tokio-rusqlite have similar write throughput                                ║");
-    println!("║     - Both significantly outperform direct blocking                                                  ║");
-    println!("║                                                                                                      ║");
-    println!("║  📊 P99 LATENCY (tail latency - most important for user experience):                                 ║");
-    println!("║     - tokio-rusqlite has PREDICTABLE latency ≈ write duration (natural queuing)                      ║");
-    println!("║     - spawn_blocking has ~2x higher P99 due to mutex contention in blocking pool                     ║");
-    println!("║     - Direct blocking has unpredictable latency due to worker thread starvation                      ║");
-    println!("║                                                                                                      ║");
-    println!("║  🏆 RECOMMENDATION:                                                                                  ║");
-    println!("║     - For multi-database scenarios with long-running operations:                                     ║");
-    println!("║       → tokio-rusqlite is the BEST choice (predictable latency, 1 thread per DB)                     ║");
-    println!("║     - For simpler use cases with fast operations:                                                    ║");
-    println!("║       → spawn_blocking is a good improvement over direct blocking                                    ║");
-    println!("║                                                                                                      ║");
-    println!("╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝");
+    println!("╔══════════════════════════════════════════════════════════════════════════════╗");
+    println!("║                           BENCHMARK COMPLETE                                 ║");
+    println!("╚══════════════════════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("  Output files in {}:", args.output_dir.display());
+    println!("    - benchmark_{}.csv   (raw data)", timestamp);
+    println!("    - summary_{}.md      (markdown summary)", timestamp);
+    println!("    - charts_{}.html     (interactive charts)", timestamp);
+    println!("    - ascii_{}.txt       (text charts)", timestamp);
+    println!();
+    println!("  To generate gnuplot charts:");
+    println!(
+        "    gnuplot -e \"datafile='{}'; outdir='{}'\" templates/plot.gp",
+        csv_path.display(),
+        args.output_dir.display()
+    );
     println!();
 }
 
+fn format_delay(delay_ms: u64) -> String {
+    if delay_ms >= 1000 {
+        format!("{}s", delay_ms / 1000)
+    } else {
+        format!("{}ms", delay_ms)
+    }
+}
+
+fn to_benchmark_result(
+    approach: &str,
+    num_databases: usize,
+    write_delay_ms: u64,
+    expected_writes: u64,
+    args: &Args,
+    results: &TestResults,
+) -> BenchmarkResult {
+    BenchmarkResult {
+        approach: approach.to_string(),
+        num_databases,
+        write_delay_ms,
+        test_duration_secs: args.duration,
+        worker_threads: args.worker_threads,
+        readers_per_db: args.readers_per_db,
+        // Read metrics
+        read_requests_completed: results.read_requests_completed,
+        read_throughput_per_sec: results.read_requests_completed as f64 / args.duration as f64,
+        avg_read_latency_ms: TestResults::compute_avg(&results.read_latencies_us),
+        p50_read_latency_ms: TestResults::compute_percentile(&results.read_latencies_us, 50.0),
+        p99_read_latency_ms: TestResults::compute_percentile(&results.read_latencies_us, 99.0),
+        max_read_latency_ms: TestResults::compute_max(&results.read_latencies_us),
+        // Write metrics
+        write_ops_completed: results.write_ops_completed,
+        write_throughput_per_sec: results.write_ops_completed as f64 / args.duration as f64,
+        avg_write_latency_ms: TestResults::compute_avg(&results.write_latencies_us),
+        p99_write_latency_ms: TestResults::compute_percentile(&results.write_latencies_us, 99.0),
+        // Starvation indicator
+        write_completion_ratio: if expected_writes > 0 {
+            results.write_ops_completed as f64 / expected_writes as f64
+        } else {
+            1.0
+        },
+    }
+}
+
+fn write_csv(
+    path: &PathBuf,
+    results: &[BenchmarkResult],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = Writer::from_path(path)?;
+    for result in results {
+        writer.serialize(result)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_summary(
+    path: &PathBuf,
+    args: &Args,
+    results: &[BenchmarkResult],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = File::create(path)?;
+
+    writeln!(file, "# SQLite Async Benchmark Results")?;
+    writeln!(file)?;
+    writeln!(
+        file,
+        "Generated: {}",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    )?;
+    writeln!(file)?;
+    writeln!(file, "## Configuration")?;
+    writeln!(file)?;
+    writeln!(file, "| Parameter | Value |")?;
+    writeln!(file, "|-----------|-------|")?;
+    writeln!(file, "| Worker threads | {} |", args.worker_threads)?;
+    writeln!(file, "| Readers per DB | {} |", args.readers_per_db)?;
+    writeln!(file, "| Test duration | {} seconds |", args.duration)?;
+    writeln!(file, "| Database counts | {:?} |", args.num_databases)?;
+    writeln!(file, "| Write delays (ms) | {:?} |", args.write_delays)?;
+    writeln!(file)?;
+
+    writeln!(file, "## Key Insight: Write Completion Ratio")?;
+    writeln!(file)?;
+    writeln!(file, "The **write completion ratio** shows what percentage of expected writes actually completed.")?;
+    writeln!(file, "A low ratio indicates worker thread starvation in direct blocking mode.")?;
+    writeln!(file)?;
+
+    // Group results by write delay
+    for &write_delay in &args.write_delays {
+        writeln!(
+            file,
+            "## Results for {} write delay",
+            format_delay(write_delay)
+        )?;
+        writeln!(file)?;
+
+        writeln!(file, "### Write Completion (Starvation Indicator)")?;
+        writeln!(file)?;
+        writeln!(
+            file,
+            "| DBs | Direct Blocking | spawn_blocking | tokio-rusqlite |"
+        )?;
+        writeln!(file, "|-----|-----------------|----------------|----------------|")?;
+
+        for &num_dbs in &args.num_databases {
+            let direct = results
+                .iter()
+                .find(|r| {
+                    r.approach == "direct_blocking"
+                        && r.num_databases == num_dbs
+                        && r.write_delay_ms == write_delay
+                })
+                .map(|r| r.write_completion_ratio * 100.0)
+                .unwrap_or(0.0);
+            let spawn = results
+                .iter()
+                .find(|r| {
+                    r.approach == "spawn_blocking"
+                        && r.num_databases == num_dbs
+                        && r.write_delay_ms == write_delay
+                })
+                .map(|r| r.write_completion_ratio * 100.0)
+                .unwrap_or(0.0);
+            let tokio = results
+                .iter()
+                .find(|r| {
+                    r.approach == "tokio_rusqlite"
+                        && r.num_databases == num_dbs
+                        && r.write_delay_ms == write_delay
+                })
+                .map(|r| r.write_completion_ratio * 100.0)
+                .unwrap_or(0.0);
+
+            writeln!(
+                file,
+                "| {} | {:.1}% | {:.1}% | {:.1}% |",
+                num_dbs, direct, spawn, tokio
+            )?;
+        }
+        writeln!(file)?;
+
+        writeln!(file, "### Read Throughput (requests/sec)")?;
+        writeln!(file)?;
+        writeln!(
+            file,
+            "| DBs | Direct Blocking | spawn_blocking | tokio-rusqlite |"
+        )?;
+        writeln!(file, "|-----|-----------------|----------------|----------------|")?;
+
+        for &num_dbs in &args.num_databases {
+            let direct = results
+                .iter()
+                .find(|r| {
+                    r.approach == "direct_blocking"
+                        && r.num_databases == num_dbs
+                        && r.write_delay_ms == write_delay
+                })
+                .map(|r| r.read_throughput_per_sec)
+                .unwrap_or(0.0);
+            let spawn = results
+                .iter()
+                .find(|r| {
+                    r.approach == "spawn_blocking"
+                        && r.num_databases == num_dbs
+                        && r.write_delay_ms == write_delay
+                })
+                .map(|r| r.read_throughput_per_sec)
+                .unwrap_or(0.0);
+            let tokio = results
+                .iter()
+                .find(|r| {
+                    r.approach == "tokio_rusqlite"
+                        && r.num_databases == num_dbs
+                        && r.write_delay_ms == write_delay
+                })
+                .map(|r| r.read_throughput_per_sec)
+                .unwrap_or(0.0);
+
+            writeln!(
+                file,
+                "| {} | {:.1} | {:.1} | {:.1} |",
+                num_dbs, direct, spawn, tokio
+            )?;
+        }
+        writeln!(file)?;
+
+        writeln!(file, "### P99 Read Latency (ms)")?;
+        writeln!(file)?;
+        writeln!(
+            file,
+            "| DBs | Direct Blocking | spawn_blocking | tokio-rusqlite |"
+        )?;
+        writeln!(file, "|-----|-----------------|----------------|----------------|")?;
+
+        for &num_dbs in &args.num_databases {
+            let direct = results
+                .iter()
+                .find(|r| {
+                    r.approach == "direct_blocking"
+                        && r.num_databases == num_dbs
+                        && r.write_delay_ms == write_delay
+                })
+                .map(|r| r.p99_read_latency_ms)
+                .unwrap_or(0.0);
+            let spawn = results
+                .iter()
+                .find(|r| {
+                    r.approach == "spawn_blocking"
+                        && r.num_databases == num_dbs
+                        && r.write_delay_ms == write_delay
+                })
+                .map(|r| r.p99_read_latency_ms)
+                .unwrap_or(0.0);
+            let tokio = results
+                .iter()
+                .find(|r| {
+                    r.approach == "tokio_rusqlite"
+                        && r.num_databases == num_dbs
+                        && r.write_delay_ms == write_delay
+                })
+                .map(|r| r.p99_read_latency_ms)
+                .unwrap_or(0.0);
+
+            writeln!(
+                file,
+                "| {} | {:.1} | {:.1} | {:.1} |",
+                num_dbs, direct, spawn, tokio
+            )?;
+        }
+        writeln!(file)?;
+    }
+
+    writeln!(file, "## Analysis")?;
+    writeln!(file)?;
+    writeln!(file, "### Why Direct Blocking Shows High Read Throughput")?;
+    writeln!(file)?;
+    writeln!(file, "When direct blocking has a **low write completion ratio** (e.g., 2% of expected writes),")?;
+    writeln!(file, "it means writer tasks are starving for worker threads. The reads that DO complete")?;
+    writeln!(file, "are opportunistic - they grab the lock during brief windows when writers are")?;
+    writeln!(file, "waiting for thread scheduling.")?;
+    writeln!(file)?;
+    writeln!(file, "This is **not** better performance - it's a symptom of broken concurrency!")?;
+    writeln!(file)?;
+    writeln!(file, "### Recommendation")?;
+    writeln!(file)?;
+    writeln!(file, "- **tokio-rusqlite** provides the most predictable latency and fair scheduling")?;
+    writeln!(file, "- **spawn_blocking** is a good improvement over direct blocking")?;
+    writeln!(
+        file,
+        "- **direct_blocking** should be avoided for long-running operations"
+    )?;
+
+    Ok(())
+}
+
+fn generate_plots(output_dir: &PathBuf, results: &[BenchmarkResult], timestamp: &str) {
+    // Generate ASCII plots (simple text charts)
+    let ascii_path = output_dir.join(format!("ascii_{}.txt", timestamp));
+    generate_ascii_plots(&ascii_path, results);
+
+    // Generate self-contained HTML visualization
+    let html_path = output_dir.join(format!("charts_{}.html", timestamp));
+    generate_html_chart(&html_path, results);
+
+    println!("    - ASCII charts: {}", ascii_path.display());
+    println!("    - HTML charts:  {}", html_path.display());
+    println!("    - For gnuplot:  Use templates/plot.gp with the CSV file");
+}
+
+fn generate_ascii_plots(path: &PathBuf, results: &[BenchmarkResult]) {
+    let mut file = File::create(path).expect("Failed to create ASCII plots file");
+
+    // Get unique values
+    let delays: Vec<u64> = results
+        .iter()
+        .map(|r| r.write_delay_ms)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let num_dbs: Vec<usize> = results
+        .iter()
+        .map(|r| r.num_databases)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    writeln!(file, "SQLite Async Benchmark Results").ok();
+    writeln!(file, "==============================\n").ok();
+
+    for delay in &delays {
+        writeln!(file, "\n{}", "=".repeat(80)).ok();
+        writeln!(
+            file,
+            "WRITE COMPLETION RATIO - {} write delay",
+            format_delay(*delay)
+        )
+        .ok();
+        writeln!(file, "(Low % = worker thread starvation)").ok();
+        writeln!(file, "{}\n", "=".repeat(80)).ok();
+
+        writeln!(
+            file,
+            "{:>10} {:>15} {:>15} {:>15}",
+            "DBs", "Direct", "spawn_block", "tokio-rsql"
+        )
+        .ok();
+        writeln!(file, "{}", "-".repeat(60)).ok();
+
+        for &dbs in &num_dbs {
+            let direct = results
+                .iter()
+                .find(|r| {
+                    r.approach == "direct_blocking"
+                        && r.num_databases == dbs
+                        && r.write_delay_ms == *delay
+                })
+                .map(|r| r.write_completion_ratio * 100.0)
+                .unwrap_or(0.0);
+            let spawn = results
+                .iter()
+                .find(|r| {
+                    r.approach == "spawn_blocking"
+                        && r.num_databases == dbs
+                        && r.write_delay_ms == *delay
+                })
+                .map(|r| r.write_completion_ratio * 100.0)
+                .unwrap_or(0.0);
+            let tokio = results
+                .iter()
+                .find(|r| {
+                    r.approach == "tokio_rusqlite"
+                        && r.num_databases == dbs
+                        && r.write_delay_ms == *delay
+                })
+                .map(|r| r.write_completion_ratio * 100.0)
+                .unwrap_or(0.0);
+
+            writeln!(
+                file,
+                "{:>10} {:>14.1}% {:>14.1}% {:>14.1}%",
+                dbs, direct, spawn, tokio
+            )
+            .ok();
+        }
+
+        writeln!(file, "\n{}", "=".repeat(80)).ok();
+        writeln!(
+            file,
+            "READ THROUGHPUT (req/sec) - {} write delay",
+            format_delay(*delay)
+        )
+        .ok();
+        writeln!(file, "{}\n", "=".repeat(80)).ok();
+
+        writeln!(
+            file,
+            "{:>10} {:>15} {:>15} {:>15}",
+            "DBs", "Direct", "spawn_block", "tokio-rsql"
+        )
+        .ok();
+        writeln!(file, "{}", "-".repeat(60)).ok();
+
+        for &dbs in &num_dbs {
+            let direct = results
+                .iter()
+                .find(|r| {
+                    r.approach == "direct_blocking"
+                        && r.num_databases == dbs
+                        && r.write_delay_ms == *delay
+                })
+                .map(|r| r.read_throughput_per_sec)
+                .unwrap_or(0.0);
+            let spawn = results
+                .iter()
+                .find(|r| {
+                    r.approach == "spawn_blocking"
+                        && r.num_databases == dbs
+                        && r.write_delay_ms == *delay
+                })
+                .map(|r| r.read_throughput_per_sec)
+                .unwrap_or(0.0);
+            let tokio = results
+                .iter()
+                .find(|r| {
+                    r.approach == "tokio_rusqlite"
+                        && r.num_databases == dbs
+                        && r.write_delay_ms == *delay
+                })
+                .map(|r| r.read_throughput_per_sec)
+                .unwrap_or(0.0);
+
+            writeln!(
+                file,
+                "{:>10} {:>15.1} {:>15.1} {:>15.1}",
+                dbs, direct, spawn, tokio
+            )
+            .ok();
+        }
+    }
+}
+
+fn generate_html_chart(path: &PathBuf, results: &[BenchmarkResult]) {
+    let mut file = File::create(path).expect("Failed to create HTML file");
+
+    let mut delays: Vec<u64> = results.iter().map(|r| r.write_delay_ms).collect();
+    delays.sort();
+    delays.dedup();
+
+    let mut dbs: Vec<usize> = results.iter().map(|r| r.num_databases).collect();
+    dbs.sort();
+    dbs.dedup();
+
+    let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>SQLite Async Benchmark Results</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }
+        h1 { color: #00d4ff; }
+        h2 { color: #00ff88; margin-top: 40px; }
+        .chart-container { width: 100%; max-width: 900px; margin: 20px auto; background: #16213e; padding: 20px; border-radius: 10px; }
+        .warning { background: #4a1515; border-left: 4px solid #ff6384; padding: 15px; margin: 20px 0; border-radius: 5px; }
+        .insight { background: #153a4a; border-left: 4px solid #4bc0c0; padding: 15px; margin: 20px 0; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>SQLite Async Benchmark Results</h1>
+    
+    <div class="warning">
+        <strong>⚠️ Important:</strong> When interpreting results, look at the <strong>Write Completion Ratio</strong> first!
+        A low ratio (e.g., 2%) means writer tasks are starving. High read throughput with low write completion
+        is a symptom of broken concurrency, not better performance.
+    </div>
+
+    <p>Comparing three approaches to SQLite operations in async Rust:</p>
+    <ul>
+        <li><strong style="color: #ff6384">Direct Blocking</strong> - SQLite calls made directly (blocks workers)</li>
+        <li><strong style="color: #36a2eb">spawn_blocking</strong> - Wrapped in tokio::task::spawn_blocking()</li>
+        <li><strong style="color: #4bc0c0">tokio-rusqlite</strong> - Dedicated thread per database</li>
+    </ul>
+"#;
+
+    write!(file, "{}", html).ok();
+
+    // Write Completion Ratio charts (new!)
+    for (idx, delay) in delays.iter().enumerate() {
+        let delay_name = format_delay(*delay);
+        let chart_id = format!("completion{}", idx);
+
+        let mut direct_data = Vec::new();
+        let mut spawn_data = Vec::new();
+        let mut tokio_data = Vec::new();
+
+        for num_db in &dbs {
+            direct_data.push(
+                results
+                    .iter()
+                    .find(|r| {
+                        r.approach == "direct_blocking"
+                            && r.num_databases == *num_db
+                            && r.write_delay_ms == *delay
+                    })
+                    .map(|r| r.write_completion_ratio * 100.0)
+                    .unwrap_or(0.0),
+            );
+            spawn_data.push(
+                results
+                    .iter()
+                    .find(|r| {
+                        r.approach == "spawn_blocking"
+                            && r.num_databases == *num_db
+                            && r.write_delay_ms == *delay
+                    })
+                    .map(|r| r.write_completion_ratio * 100.0)
+                    .unwrap_or(0.0),
+            );
+            tokio_data.push(
+                results
+                    .iter()
+                    .find(|r| {
+                        r.approach == "tokio_rusqlite"
+                            && r.num_databases == *num_db
+                            && r.write_delay_ms == *delay
+                    })
+                    .map(|r| r.write_completion_ratio * 100.0)
+                    .unwrap_or(0.0),
+            );
+        }
+
+        writeln!(
+            file,
+            r#"
+    <h2>Write Completion Ratio - {} Write Delay</h2>
+    <div class="insight">Lower is worse! A ratio &lt;100% means writer tasks are starving for worker threads.</div>
+    <div class="chart-container">
+        <canvas id="{}"></canvas>
+    </div>
+    <script>
+        new Chart(document.getElementById('{}'), {{
+            type: 'bar',
+            data: {{
+                labels: {:?},
+                datasets: [
+                    {{ label: 'Direct Blocking', data: {:?}, backgroundColor: 'rgba(255, 99, 132, 0.8)', borderColor: 'rgb(255, 99, 132)', borderWidth: 1 }},
+                    {{ label: 'spawn_blocking', data: {:?}, backgroundColor: 'rgba(54, 162, 235, 0.8)', borderColor: 'rgb(54, 162, 235)', borderWidth: 1 }},
+                    {{ label: 'tokio-rusqlite', data: {:?}, backgroundColor: 'rgba(75, 192, 192, 0.8)', borderColor: 'rgb(75, 192, 192)', borderWidth: 1 }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                plugins: {{
+                    title: {{ display: true, text: 'Write Completion Ratio (%) - {} Write Delay', color: '#eee', font: {{ size: 16 }} }},
+                    legend: {{ labels: {{ color: '#eee' }} }}
+                }},
+                scales: {{
+                    x: {{ title: {{ display: true, text: 'Number of Databases', color: '#eee' }}, ticks: {{ color: '#aaa' }}, grid: {{ color: '#333' }} }},
+                    y: {{ title: {{ display: true, text: 'Completion %', color: '#eee' }}, ticks: {{ color: '#aaa' }}, grid: {{ color: '#333' }}, max: 110 }}
+                }}
+            }}
+        }});
+    </script>
+"#,
+            delay_name,
+            chart_id,
+            chart_id,
+            dbs,
+            direct_data,
+            spawn_data,
+            tokio_data,
+            delay_name
+        )
+        .ok();
+    }
+
+    // Read throughput charts
+    for (idx, delay) in delays.iter().enumerate() {
+        let delay_name = format_delay(*delay);
+        let chart_id = format!("throughput{}", idx);
+
+        let mut direct_data = Vec::new();
+        let mut spawn_data = Vec::new();
+        let mut tokio_data = Vec::new();
+
+        for num_db in &dbs {
+            direct_data.push(
+                results
+                    .iter()
+                    .find(|r| {
+                        r.approach == "direct_blocking"
+                            && r.num_databases == *num_db
+                            && r.write_delay_ms == *delay
+                    })
+                    .map(|r| r.read_throughput_per_sec)
+                    .unwrap_or(0.0),
+            );
+            spawn_data.push(
+                results
+                    .iter()
+                    .find(|r| {
+                        r.approach == "spawn_blocking"
+                            && r.num_databases == *num_db
+                            && r.write_delay_ms == *delay
+                    })
+                    .map(|r| r.read_throughput_per_sec)
+                    .unwrap_or(0.0),
+            );
+            tokio_data.push(
+                results
+                    .iter()
+                    .find(|r| {
+                        r.approach == "tokio_rusqlite"
+                            && r.num_databases == *num_db
+                            && r.write_delay_ms == *delay
+                    })
+                    .map(|r| r.read_throughput_per_sec)
+                    .unwrap_or(0.0),
+            );
+        }
+
+        writeln!(
+            file,
+            r#"
+    <h2>Read Throughput - {} Write Delay</h2>
+    <div class="chart-container">
+        <canvas id="{}"></canvas>
+    </div>
+    <script>
+        new Chart(document.getElementById('{}'), {{
+            type: 'bar',
+            data: {{
+                labels: {:?},
+                datasets: [
+                    {{ label: 'Direct Blocking', data: {:?}, backgroundColor: 'rgba(255, 99, 132, 0.8)', borderColor: 'rgb(255, 99, 132)', borderWidth: 1 }},
+                    {{ label: 'spawn_blocking', data: {:?}, backgroundColor: 'rgba(54, 162, 235, 0.8)', borderColor: 'rgb(54, 162, 235)', borderWidth: 1 }},
+                    {{ label: 'tokio-rusqlite', data: {:?}, backgroundColor: 'rgba(75, 192, 192, 0.8)', borderColor: 'rgb(75, 192, 192)', borderWidth: 1 }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                plugins: {{
+                    title: {{ display: true, text: 'Read Throughput (requests/sec) - {} Write Delay', color: '#eee', font: {{ size: 16 }} }},
+                    legend: {{ labels: {{ color: '#eee' }} }}
+                }},
+                scales: {{
+                    x: {{ title: {{ display: true, text: 'Number of Databases', color: '#eee' }}, ticks: {{ color: '#aaa' }}, grid: {{ color: '#333' }} }},
+                    y: {{ title: {{ display: true, text: 'Requests/sec', color: '#eee' }}, ticks: {{ color: '#aaa' }}, grid: {{ color: '#333' }} }}
+                }}
+            }}
+        }});
+    </script>
+"#,
+            delay_name,
+            chart_id,
+            chart_id,
+            dbs,
+            direct_data,
+            spawn_data,
+            tokio_data,
+            delay_name
+        )
+        .ok();
+    }
+
+    // P99 Latency charts
+    for (idx, delay) in delays.iter().enumerate() {
+        let delay_name = format_delay(*delay);
+        let chart_id = format!("latency{}", idx);
+
+        let mut direct_data = Vec::new();
+        let mut spawn_data = Vec::new();
+        let mut tokio_data = Vec::new();
+
+        for num_db in &dbs {
+            direct_data.push(
+                results
+                    .iter()
+                    .find(|r| {
+                        r.approach == "direct_blocking"
+                            && r.num_databases == *num_db
+                            && r.write_delay_ms == *delay
+                    })
+                    .map(|r| r.p99_read_latency_ms)
+                    .unwrap_or(0.0),
+            );
+            spawn_data.push(
+                results
+                    .iter()
+                    .find(|r| {
+                        r.approach == "spawn_blocking"
+                            && r.num_databases == *num_db
+                            && r.write_delay_ms == *delay
+                    })
+                    .map(|r| r.p99_read_latency_ms)
+                    .unwrap_or(0.0),
+            );
+            tokio_data.push(
+                results
+                    .iter()
+                    .find(|r| {
+                        r.approach == "tokio_rusqlite"
+                            && r.num_databases == *num_db
+                            && r.write_delay_ms == *delay
+                    })
+                    .map(|r| r.p99_read_latency_ms)
+                    .unwrap_or(0.0),
+            );
+        }
+
+        writeln!(
+            file,
+            r#"
+    <h2>P99 Read Latency - {} Write Delay</h2>
+    <div class="chart-container">
+        <canvas id="{}"></canvas>
+    </div>
+    <script>
+        new Chart(document.getElementById('{}'), {{
+            type: 'bar',
+            data: {{
+                labels: {:?},
+                datasets: [
+                    {{ label: 'Direct Blocking', data: {:?}, backgroundColor: 'rgba(255, 99, 132, 0.8)', borderColor: 'rgb(255, 99, 132)', borderWidth: 1 }},
+                    {{ label: 'spawn_blocking', data: {:?}, backgroundColor: 'rgba(54, 162, 235, 0.8)', borderColor: 'rgb(54, 162, 235)', borderWidth: 1 }},
+                    {{ label: 'tokio-rusqlite', data: {:?}, backgroundColor: 'rgba(75, 192, 192, 0.8)', borderColor: 'rgb(75, 192, 192)', borderWidth: 1 }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                plugins: {{
+                    title: {{ display: true, text: 'P99 Read Latency (ms) - {} Write Delay', color: '#eee', font: {{ size: 16 }} }},
+                    legend: {{ labels: {{ color: '#eee' }} }}
+                }},
+                scales: {{
+                    x: {{ title: {{ display: true, text: 'Number of Databases', color: '#eee' }}, ticks: {{ color: '#aaa' }}, grid: {{ color: '#333' }} }},
+                    y: {{ title: {{ display: true, text: 'Latency (ms)', color: '#eee' }}, ticks: {{ color: '#aaa' }}, grid: {{ color: '#333' }} }}
+                }}
+            }}
+        }});
+    </script>
+"#,
+            delay_name,
+            chart_id,
+            chart_id,
+            dbs,
+            direct_data,
+            spawn_data,
+            tokio_data,
+            delay_name
+        )
+        .ok();
+    }
+
+    writeln!(file, "</body></html>").ok();
+}
