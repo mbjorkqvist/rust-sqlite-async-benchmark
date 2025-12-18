@@ -135,19 +135,31 @@ The benchmark tests each approach across:
 
 With 4 Tokio worker threads, 3 readers per database, and varying write delays:
 
+### Write Completion Ratio - 1s write delay
+
+The write completion ratio shows what percentage of expected writes actually completed. A low ratio indicates **worker
+thread starvation** in direct blocking mode.
+
+| DBs | Direct Blocking | spawn_blocking | tokio-rusqlite |
+|-----|-----------------|----------------|----------------|
+| 1   | 100%            | 100%           | 100%           |
+| 10  | 27%             | 100%           | 100%           |
+| 50  | 6%              | 100%           | 100%           |
+| 100 | 2%              | 100%           | 100%           |
+
 ### Read Throughput (requests/sec) - 1s write delay
 
 | DBs | Direct Blocking | spawn_blocking | tokio-rusqlite |
 |-----|-----------------|----------------|----------------|
-| 1   | ~150            | ~180           | ~180           |
-| 10  | ~100            | ~600           | ~650           |
-| 50  | ~50             | ~400           | ~500           |
-| 100 | ~30             | ~300           | ~400           |
+| 1   | ~3              | ~3             | ~3             |
+| 10  | ~16             | ~30            | ~30            |
+| 50  | ~32             | ~130           | ~150           |
+| 100 | ~40             | ~256           | ~301           |
 
 ### Key Findings
 
 1. **Direct Blocking
-   ** suffers as database count increases because blocked worker threads can't service other async tasks
+   ** suffers severely as database count increases - at 100 databases, only 2% of expected writes complete due to worker thread starvation
 2. **spawn_blocking** scales better by offloading to the blocking thread pool
 3. **tokio-rusqlite** provides the most predictable latency due to its dedicated-thread-per-database model
 
