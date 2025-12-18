@@ -26,6 +26,7 @@ struct Args {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Fields are required for CSV deserialization even if not directly accessed
 struct BenchmarkResult {
     approach: String,
     num_databases: usize,
