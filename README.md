@@ -156,6 +156,19 @@ thread starvation** in direct blocking mode.
 | 50  | ~32             | ~130           | ~150           |
 | 100 | ~40             | ~256           | ~301           |
 
+### P99 Read Latency (ms) - 1s write delay
+
+This metric highlights the difference between `spawn_blocking` and `tokio-rusqlite`. While both achieve
+similar throughput, `tokio-rusqlite` maintains consistent latency due to its dedicated-thread-per-database
+model, whereas `spawn_blocking` suffers from contention on the shared blocking thread pool.
+
+| DBs | Direct Blocking | spawn_blocking | tokio-rusqlite |
+|-----|-----------------|----------------|----------------|
+| 1   | ~2000           | ~1000          | ~1000          |
+| 10  | ~1000           | ~2000          | ~1000          |
+| 50  | ~1000           | ~3000          | ~1000          |
+| 100 | ~1000           | ~3000          | ~1000          |
+
 ### Key Findings
 
 1. **Direct Blocking** suffers severely as database count increases - at 100 databases, only 2% of expected writes complete due to worker thread starvation
