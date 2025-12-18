@@ -1,10 +1,12 @@
 # SQLite Async Benchmark
 
-A comprehensive benchmark comparing three approaches to handling SQLite operations in async Rust (Tokio):
+A benchmark comparing three approaches to handling SQLite operations in async Rust (Tokio):
 
 1. **Direct Blocking** - SQLite calls made directly in async context (blocks Tokio worker threads)
 2. **spawn_blocking** - SQLite calls wrapped in `tokio::task::spawn_blocking()`
 3. **tokio-rusqlite** - Dedicated thread per database (using the `tokio-rusqlite` crate pattern)
+
+The first approach is the one currently implemented in the [ICRC Rosetta](https://github.com/dfinity/ic/tree/f8cb61d9549193cd0b387a53b0d927bf9ac5e9de/rs/rosetta-api/icrc1) application. In production, slow response times to some query endpoints have been observed as the number of tokens (and thus databases) increases, leading to contention on the limited Tokio worker threads. ICRC Rosetta has one thread (the block synchronization thread) that regularly queries the ledger for new blocks and writes them to the database, as well as updating the balances of accounts affected by the transactions in the retrieved blocks. As part of servicing client query requests to the ICRC Rosetta HTTP endpoints, the databases are queried for account balances, transaction histories, and block data. With many databases and frequent writes, the blocking SQLite calls can lead to high latency for read queries, as the worker threads are blocked waiting for the database operations to complete. This benchmark aims to quantify the performance impact of each approach under varying workloads.
 
 ## Quick Start
 
@@ -87,6 +89,7 @@ After running the benchmark, you'll find in `results/` (which is gitignored):
 ## Viewing Results
 
 ### Interactive Charts
+
 ```bash
 # macOS
 open results/plots_*/charts.html
@@ -96,12 +99,15 @@ xdg-open results/plots_*/charts.html
 ```
 
 ### Terminal Summary
+
 The benchmark prints a summary to stdout. You can also view the markdown summary:
+
 ```bash
 cat results/summary_*.md
 ```
 
 ### Using Gnuplot
+
 ```bash
 # Use the template with your CSV file
 gnuplot -e "datafile='results/benchmark_YYYYMMDD_HHMMSS.csv'; outdir='results'" templates/plot.gp
@@ -113,7 +119,7 @@ open results/benchmark_charts.png
 ### Metrics
 
 - **Read Throughput**: Number of read operations completed per second
-- **Write Throughput**: Number of write operations completed per second  
+- **Write Throughput**: Number of write operations completed per second
 - **Avg Read Latency**: Average time for a read operation
 - **P99 Read Latency**: 99th percentile read latency (tail latency)
 - **Max Read Latency**: Maximum observed read latency
@@ -121,6 +127,7 @@ open results/benchmark_charts.png
 ### Test Scenarios
 
 The benchmark tests each approach across:
+
 - Different numbers of databases (simulating multi-token scenarios like ICRC Rosetta)
 - Different write delays (simulating slow disk I/O or large database operations)
 
@@ -139,7 +146,8 @@ With 4 Tokio worker threads, 3 readers per database, and varying write delays:
 
 ### Key Findings
 
-1. **Direct Blocking** suffers as database count increases because blocked worker threads can't service other async tasks
+1. **Direct Blocking
+   ** suffers as database count increases because blocked worker threads can't service other async tasks
 2. **spawn_blocking** scales better by offloading to the blocking thread pool
 3. **tokio-rusqlite** provides the most predictable latency due to its dedicated-thread-per-database model
 
