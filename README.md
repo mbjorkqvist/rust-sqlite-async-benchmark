@@ -158,8 +158,7 @@ thread starvation** in direct blocking mode.
 
 ### Key Findings
 
-1. **Direct Blocking
-   ** suffers severely as database count increases - at 100 databases, only 2% of expected writes complete due to worker thread starvation
+1. **Direct Blocking** suffers severely as database count increases - at 100 databases, only 2% of expected writes complete due to worker thread starvation
 2. **spawn_blocking** scales better by offloading to the blocking thread pool
 3. **tokio-rusqlite** provides the most predictable latency due to its dedicated-thread-per-database model
 
